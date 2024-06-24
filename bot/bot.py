@@ -17,7 +17,7 @@ dataset_filepath = "./data/input/extracted_data.csv"
 # bot relates vars
 TOKEN = os.getenv("TOKEN")
 # Define states for conversation
-CHOOSING, TYPING_REPLY, TYPING_PRICE = range(3)
+CHOOSING, TYPING_INTENT, TYPING_PRICE, SEMANTIC_SEARCH = range(4)
 
 # Blockchain env vars
 address = Web3.to_checksum_address(os.getenv("METAMASK_WALLET_ADDRESS"))
@@ -65,25 +65,30 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     return CHOOSING
 
 
-async def received_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def received_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_input = update.message.text
     try:
         # Assume we expect a number as input
-        price = int(user_input)
+        price = float(user_input)
         # Store the user input in context.user_data
         context.user_data['input_price'] = price
-        await update.message.reply_text(f'Thanks! You proposed a price of {price}.\n Please wait for smartcontract deployment')
+
+    except ValueError:
+        await update.message.reply_text('Invalid input. Please enter a valid number.')
+        return TYPING_PRICE
+
+    else:
+        await update.message.reply_text(f'Thanks! You proposed a price of {price}.\n Please wait for smartcontract deployment.')
 
         tx_hash = compile_smartcontract.deploy_smartcontract(w3_provider, chain_id, private_key, address, sol_smartcontract_filepath)
 
         eth_scan_link = compile_smartcontract.get_eth_sepolia_scanner_link(tx_hash.hex())
 
-        await update.message.reply_text(f'Intent smartcontract deployed with tx hash {tx_hash.hex()}.\n View in {eth_scan_link}')
+        await update.message.reply_text(f'Intent smartcontract deployed with tx hash: {tx_hash.hex()}.\n View in {eth_scan_link}')
 
-    except ValueError:
-        await update.message.reply_text('Invalid input. Please enter a valid number.')
-        return TYPING_PRICE
-    return ConversationHandler.END
+        await semantic_search(update, context)
+
+        return SEMANTIC_SEARCH
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -98,7 +103,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     if query.data == 'provide_input':
         await query.edit_message_text(text="Describe your intent")
-        return TYPING_REPLY
+        return TYPING_INTENT
     elif query.data == 'cancel':
         await query.edit_message_text(text="See you next time")
         return ConversationHandler.END
@@ -108,14 +113,17 @@ async def received_intent(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user_input = update.message.text
     context.user_data['input_intent'] = user_input
     await update.message.reply_text("Thanks for your intent! Now, propose your price.")
+
     return TYPING_PRICE
 
 
+# async def semantic_search(user_input) -> None:
 async def semantic_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_input = update.message.text
+    print("semantic_search")
+    user_input = context.user_data.get('input_intent')
 
     # Generate embedding for the user's question
-    question_embedding = nlp.get_embeddings([user_input]).numpy()
+    question_embedding = nlp.get_embeddings(tokenizer, [user_input], model).numpy()
 
     # Perform a search to find the nearest neighbors to the question embedding
     D, I = index.search(question_embedding, k=5)
@@ -129,12 +137,18 @@ async def semantic_search(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # Sort the results by scores in descending order
     results = results.sort_values("scores", ascending=False)
 
+
+
+
     for _, row in results.iterrows():
         match = row['User_Request']
         score = row['scores']
-        message = f"{match} -- Confidence score: {score}"
+        message = f"{match}\n" + 10*"-" + f"\nConfidence score: {score}\n" + row['wallet']
         print(message)
-        await context.bot.send_message(chat_id=update.message.chat_id, text=message)
+        await update.message.reply_text(message)
+        # await context.bot.send_message(chat_id=update.message.chat_id, text=message)
+
+    return ConversationHandler.END
 
 
 def main() -> None:
@@ -148,28 +162,29 @@ def main() -> None:
 
     print("bot launched")
 
-    # Define the conversation handler with the states CHOOSING and TYPING_REPLY
+    # Define the conversation handler with the states CHOOSING and TYPING_INTENT
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
         states={
             CHOOSING: [
                 CallbackQueryHandler(button),
             ],
-            TYPING_REPLY: [
+            TYPING_INTENT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, received_intent),
             ],
             TYPING_PRICE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, received_price),
             ],
+            # SEMANTIC_SEARCH: [
+            #     MessageHandler(filters.TEXT & ~filters.COMMAND, semantic_search),
+            # ]
         },
         fallbacks=[CommandHandler('cancel', cancel)],
     )
 
     application.add_handler(conv_handler)
 
-    # application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, nlp.semantic_search))
-
-    application.run_polling()
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 
